@@ -31,11 +31,22 @@ from utils.prompts import (
 # ---------------------------------------------------------------------------
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
+# Write logs to file AND console so failures are always recorded
 Path("outputs").mkdir(exist_ok=True)
 Path("data").mkdir(exist_ok=True)
+Path("logs").mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[
+        logging.FileHandler("logs/app.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+logger.info("AI Job Copilot started.")
 
 st.set_page_config(
     page_title="AI Job Copilot",
@@ -181,7 +192,9 @@ DEFAULTS = {
     "jd_text": "",
     "cover_letter_draft": "",
     "outputs": {},
+    "confidence_scores": {},
     "evaluation": {},
+    "feedback": {},
     "generated": False,
     "api_key_valid": False,
     "openai_client": None,
@@ -227,23 +240,60 @@ def _score_card(label: str, value, suffix: str = "") -> str:
 
 
 def _call_openai(client: OpenAI, user_prompt: str, max_tokens: int = 1_500) -> str:
-    """Thin wrapper around ChatCompletion with basic error handling."""
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": get_system_prompt()},
-            {"role": "user", "content": user_prompt},
-        ],
-        max_tokens=max_tokens,
-        temperature=0.7,
+    """Thin wrapper around ChatCompletion with logging."""
+    logger.info("OpenAI call — prompt length: %d chars, max_tokens: %d", len(user_prompt), max_tokens)
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": get_system_prompt()},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.7,
+        )
+        result = response.choices[0].message.content.strip()
+        logger.info("OpenAI call succeeded — response length: %d chars", len(result))
+        return result
+    except Exception as exc:
+        logger.error("OpenAI call failed: %s", exc)
+        raise
+
+
+def _score_confidence(client: OpenAI, output_name: str, content: str, context: str) -> int:
+    """
+    Ask GPT-4o-mini to rate its own confidence in the generated output (1-10).
+    Returns an integer score. Falls back to 5 on any error.
+    """
+    prompt = (
+        f"You just generated the following {output_name} for a job application:\n\n"
+        f"{content[:800]}\n\n"
+        f"The candidate context available was:\n{context[:400]}\n\n"
+        f"On a scale of 1-10, how confident are you that this output is accurate, "
+        f"relevant, and well-grounded in the candidate's actual experience? "
+        f"Reply with ONLY a single integer between 1 and 10."
     )
-    return response.choices[0].message.content.strip()
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=5,
+            temperature=0,
+        )
+        raw = response.choices[0].message.content.strip()
+        score = int("".join(filter(str.isdigit, raw)))
+        logger.info("Confidence score for %s: %d/10", output_name, score)
+        return max(1, min(10, score))
+    except Exception as exc:
+        logger.warning("Confidence scoring failed for %s: %s", output_name, exc)
+        return 5
 
 
 def _save_output(filename: str, content: str) -> str:
     """Write content to the outputs/ directory, return the path."""
     path = Path("outputs") / filename
     path.write_text(content, encoding="utf-8")
+    logger.info("Saved output to %s", path)
     return str(path)
 
 
@@ -264,10 +314,15 @@ def run_generation_pipeline(
     Returns a dict with all generated outputs.
     """
     outputs: Dict = {}
+    confidence: Dict = {}
+
+    logger.info("Pipeline started — resume length: %d chars, JD length: %d chars",
+                len(resume_text), len(jd_text))
 
     # 1. Build vector store
     status_text.markdown("**Step 1/6 — Building vector store from resume…**")
     chunks = chunk_text(resume_text)
+    logger.info("Chunked resume into %d chunks", len(chunks))
     index, store_chunks = build_vector_store(chunks, client)
     st.session_state["vector_store"] = index
     st.session_state["store_chunks"] = store_chunks
@@ -277,18 +332,21 @@ def run_generation_pipeline(
     status_text.markdown("**Step 2/6 — Retrieving relevant resume sections…**")
     relevant = retrieve_relevant_chunks(jd_text, index, store_chunks, client, k=6)
     context = build_context(relevant, max_words=2_000)
+    logger.info("Retrieved %d relevant chunks", len(relevant))
     progress_bar.progress(28)
 
     # 3. Resume bullet points
     status_text.markdown("**Step 3/6 — Generating ATS-optimised resume bullets…**")
     bullets_prompt = get_resume_bullets_prompt(context, jd_text)
     outputs["resume_bullets"] = _call_openai(client, bullets_prompt, max_tokens=800)
+    confidence["resume_bullets"] = _score_confidence(client, "resume bullets", outputs["resume_bullets"], context)
     progress_bar.progress(43)
 
     # 4. Cover letter
     status_text.markdown("**Step 4/6 — Writing tailored cover letter…**")
     cl_prompt = get_cover_letter_prompt(context, jd_text, cover_letter_draft or None)
     outputs["cover_letter"] = _call_openai(client, cl_prompt, max_tokens=700)
+    confidence["cover_letter"] = _score_confidence(client, "cover letter", outputs["cover_letter"], context)
     progress_bar.progress(58)
 
     # 5. Interview questions + STAR answers
@@ -297,14 +355,19 @@ def run_generation_pipeline(
     outputs["interview_questions"] = _call_openai(client, iq_prompt, max_tokens=600)
     star_prompt = get_star_answers_prompt(context, outputs["interview_questions"])
     outputs["star_answers"] = _call_openai(client, star_prompt, max_tokens=1_500)
+    confidence["interview_questions"] = _score_confidence(client, "interview questions", outputs["interview_questions"], context)
+    confidence["star_answers"] = _score_confidence(client, "STAR answers", outputs["star_answers"], context)
     progress_bar.progress(75)
 
     # 6. Skill gap analysis
     status_text.markdown("**Step 6/6 — Analysing skill gaps…**")
     gap_prompt = get_skill_gap_prompt(resume_text, jd_text)
     outputs["skill_gap"] = _call_openai(client, gap_prompt, max_tokens=900)
+    confidence["skill_gap"] = _score_confidence(client, "skill gap analysis", outputs["skill_gap"], context)
     progress_bar.progress(92)
 
+    logger.info("Pipeline complete. Confidence scores: %s", confidence)
+    st.session_state["confidence_scores"] = confidence
     return outputs
 
 
@@ -632,12 +695,17 @@ else:  # Home
 
         # Score cards row
         eval_data = st.session_state["evaluation"]
+        confidence_scores = st.session_state.get("confidence_scores", {})
         keyword_score = eval_data.get("keyword_match", {}).get("score", 0)
         relevance = eval_data.get("relevance_score", 0)
         missing_count = eval_data.get("skill_analysis", {}).get("missing_count", 0)
         grounding = eval_data.get("hallucination_check", {}).get("grounding_score", 100)
+        avg_confidence = (
+            round(sum(confidence_scores.values()) / len(confidence_scores), 1)
+            if confidence_scores else "—"
+        )
 
-        s1, s2, s3, s4 = st.columns(4)
+        s1, s2, s3, s4, s5 = st.columns(5)
         with s1:
             st.markdown(_score_card("Keyword Match", f"{keyword_score:.0f}", "%"), unsafe_allow_html=True)
         with s2:
@@ -646,6 +714,25 @@ else:  # Home
             st.markdown(_score_card("Missing Skills", missing_count), unsafe_allow_html=True)
         with s4:
             st.markdown(_score_card("Grounding Score", f"{grounding:.0f}", "%"), unsafe_allow_html=True)
+        with s5:
+            st.markdown(_score_card("AI Confidence", f"{avg_confidence}", "/10"), unsafe_allow_html=True)
+
+        # Confidence breakdown
+        if confidence_scores:
+            st.markdown("<br>", unsafe_allow_html=True)
+            with st.expander("🤖 AI Self-Confidence Breakdown", expanded=False):
+                st.caption("The AI rated how confident it was in each output based on the context provided (1 = low, 10 = high).")
+                cc = st.columns(len(confidence_scores))
+                for i, (name, score) in enumerate(confidence_scores.items()):
+                    label = name.replace("_", " ").title()
+                    colour = "score-green" if score >= 7 else ("score-yellow" if score >= 5 else "score-red")
+                    cc[i].markdown(
+                        f'<div class="score-card">'
+                        f'<div class="score-value {colour}">{score}/10</div>'
+                        f'<div class="score-label">{label}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -891,6 +978,53 @@ else:  # Home
                 mime="application/json",
                 use_container_width=False,
             )
+
+        # ---- Human Feedback Panel ---- #
+        st.divider()
+        st.markdown("### 🧑‍⚖️ Human Evaluation")
+        st.caption("Rate each output. Your feedback is saved to `outputs/feedback.json` for future review.")
+
+        OUTPUTS_TO_RATE = {
+            "resume_bullets": "Resume Bullets",
+            "cover_letter": "Cover Letter",
+            "interview_questions": "Interview Questions",
+            "star_answers": "STAR Answers",
+            "skill_gap": "Skill Gap Analysis",
+        }
+
+        feedback: Dict = st.session_state.get("feedback", {})
+        fb_cols = st.columns(len(OUTPUTS_TO_RATE))
+
+        for i, (key, label) in enumerate(OUTPUTS_TO_RATE.items()):
+            with fb_cols[i]:
+                st.markdown(f"**{label}**")
+                rating = st.radio(
+                    f"Rate {label}",
+                    options=["⭐", "⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"],
+                    index=feedback.get(key, {}).get("stars", 2),
+                    key=f"rating_{key}",
+                    label_visibility="collapsed",
+                )
+                feedback.setdefault(key, {})["stars"] = ["⭐", "⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"].index(rating)
+                feedback[key]["label"] = rating
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        overall_notes = st.text_area(
+            "Overall notes (optional)",
+            placeholder="Any comments on the quality, accuracy, or usefulness of the outputs…",
+            height=80,
+            key="feedback_notes",
+        )
+
+        if st.button("💾 Save Feedback", use_container_width=False):
+            import json
+            feedback["overall_notes"] = overall_notes
+            feedback["timestamp"] = datetime.now().isoformat()
+            feedback["confidence_scores"] = confidence_scores
+            st.session_state["feedback"] = feedback
+            _save_output("feedback.json", json.dumps(feedback, indent=2))
+            logger.info("Human feedback saved: %s", feedback)
+            st.success("✅ Feedback saved to outputs/feedback.json")
 
         # ---- Download All Bundle ---- #
         st.divider()

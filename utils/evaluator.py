@@ -80,10 +80,17 @@ def keyword_match_score(resume_text: str, job_description: str) -> Dict:
     }
 
 
+def _skill_present(skill: str, text: str) -> bool:
+    """Return True if *skill* appears as a whole word (or phrase) in *text*."""
+    pattern = r"\b" + re.escape(skill) + r"\b"
+    return bool(re.search(pattern, text))
+
+
 def detect_missing_skills(resume_text: str, job_description: str) -> Dict:
     """
     Check TECH_SKILLS list against both texts to identify what the JD asks for
     that the candidate's resume does not mention.
+    Uses whole-word matching to avoid false positives (e.g. 'r' inside 'great').
     """
     resume_lower = resume_text.lower()
     jd_lower = job_description.lower()
@@ -92,8 +99,8 @@ def detect_missing_skills(resume_text: str, job_description: str) -> Dict:
     missing: List[str] = []
 
     for skill in TECH_SKILLS:
-        if skill in jd_lower:
-            (present if skill in resume_lower else missing).append(skill)
+        if _skill_present(skill, jd_lower):
+            (present if _skill_present(skill, resume_lower) else missing).append(skill)
 
     return {
         "present_skills": present,
