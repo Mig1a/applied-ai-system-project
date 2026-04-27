@@ -2,7 +2,6 @@
 
 **Project:** AI Job Copilot
 **Author:** Million Aboye
-**Course:** GMU AI 101 — Project 4 | Spring 2026
 **Version:** 1.0
 **Last Updated:** April 2026
 
@@ -298,4 +297,4 @@ The better approach — which I pushed back on and we agreed to implement instea
 
 ---
 
-*Model Card for AI Job Copilot v1.0 | GMU AI 101 — Project 4 | Spring 2026*
+*Model Card for AI Job Copilot v1.0 | Spring 2026*
