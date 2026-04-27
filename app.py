@@ -417,7 +417,7 @@ with st.sidebar:
     st.divider()
     st.markdown(
         '<p style="font-size:0.72rem; color:#64748b; text-align:center;">'
-        "AI Job Copilot v1.0<br>GMU AI 101 — Project 4</p>",
+        "AI Job Copilot v1.0</p>",
         unsafe_allow_html=True,
     )
 
