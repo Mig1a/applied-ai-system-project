@@ -1,0 +1,18 @@
+# Environment — never commit real secrets
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test cache
+.pytest_cache/
+
+# Logs and generated outputs
+logs/
+outputs/
+
+# OS files
+.DS_Store
+Thumbs.db
